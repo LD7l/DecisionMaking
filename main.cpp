@@ -6,6 +6,7 @@
 //  Copyright (c) 2021 Jakob Snauwaert. All rights reserved.
 //
 
+#include <ilcplex/ilocplex.h>
 #include <iostream>
 #include <math.h>
 #include <stdio.h>
@@ -433,9 +434,7 @@ void evaluate_line_of_work()
         violations[4]++;
     
 }
-/**
- Evaluation of the personnel schedule constructed by the students.
- */
+
 void evaluate_solution()
 {
     strcpy(filename, "files/Violations_dpt_");
@@ -483,58 +482,107 @@ void evaluate_solution()
     fclose(output);
 }
 
-/**
- Write your own procedure to construct a monthly nurse roster
- */
 void procedure()
 {
-    /**TO IMPLEMENT*/
-    
-    for (k = 0; k < number_nurses; k++)			// Example: set your monthly roster exactly equal to the cyclic roster
-    {	for (i = 0; i < number_days; i++)
-        monthly_roster[k][i] = cyclic_roster[k][i];
-    }	
+    IloEnv env;
+    try {
+        IloModel model(env);
+        int N = number_nurses;   // aantal verpleegkundigen
+        int D = number_days;     // aantal dagen (28)
+        int S = number_shifts;   // 5 shifts: 0 vroeg, 1 dag, 2 laat, 3 nacht, 4 vrij
 
+        // Beslissingsvariabelen: x[n][d][s] = 1 als verpleegkundige n op dag d shift s werkt
+        IloArray<IloArray<IloBoolVarArray>> x(env, N);
+        for (int n = 0; n < N; n++) {
+            x[n] = IloArray<IloBoolVarArray>(env, D);
+            for (int d = 0; d < D; d++)
+                x[n][d] = IloBoolVarArray(env, S);
+        }
+
+        // Regel 1: elke verpleegkundige krijgt per dag precies 1 shift (vrije dag telt mee)
+        for (int n = 0; n < N; n++)
+            for (int d = 0; d < D; d++)
+                model.add(IloSum(x[n][d]) == 1);
+
+        // Regel 2: per dag en per werkshift minstens het vereiste aantal verpleegkundigen
+        for (int d = 0; d < D; d++)
+            for (int s = 0; s < 4; s++) {
+                IloExpr bezetting(env);
+                for (int n = 0; n < N; n++)
+                    bezetting += x[n][d][s];
+                model.add(bezetting >= req[d][s]);
+                bezetting.end();
+            }
+
+        // Regel 3: elke verpleegkundige werkt tussen haar minimum en maximum aantal dagen
+        for (int n = 0; n < N; n++) {
+            IloExpr gewerkt(env);
+            for (int d = 0; d < D; d++)
+                for (int s = 0; s < 4; s++)
+                    gewerkt += x[n][d][s];
+            model.add(gewerkt >= min_ass[n]);
+            model.add(gewerkt <= max_ass[n]);
+            gewerkt.end();
+        }
+
+        // Doel: totale preferentiescore minimaliseren
+        IloExpr doel(env);
+        for (int n = 0; n < N; n++)
+            for (int d = 0; d < D; d++)
+                for (int s = 0; s < S; s++)
+                    doel += pref[n][d][s] * x[n][d][s];
+        model.add(IloMinimize(env, doel));
+        doel.end();
+
+        // Oplossen (maximaal 60 seconden)
+        IloCplex cplex(model);
+        cplex.setParam(IloCplex::Param::TimeLimit, 60);
+
+        if (cplex.solve()) {
+            // Oplossing overzetten naar het rooster van de template
+            for (int n = 0; n < N; n++)
+                for (int d = 0; d < D; d++)
+                    for (int s = 0; s < S; s++)
+                        if (cplex.getValue(x[n][d][s]) > 0.5)
+                            monthly_roster[n][d] = s;
+            printf("Oplossing gevonden. Preferentiescore: %f\n", cplex.getObjValue());
+        } else {
+            printf("Geen oplossing gevonden. Status: %d\n", (int)cplex.getStatus());
+        }
+    }
+    catch (IloException& e) {
+        std::cerr << "CPLEX fout: " << e << std::endl;
+    }
+    env.end();
 }
 
 void add_nurse_to_day_shift(int nurseID,int dayID,int shiftID)
 {
-    /** PAY ATTENTION: use the shift encoding used in the algorithm and NOT your own shift ranking
-     Remark: shiftID has been defined in read_shift_system: 0 (early), 1 (day), 3 (late), 4 (night) and 5 (free) */
     monthly_roster[nurseID][dayID]=shiftID;
 }
 
 
 int main (int argc, char * const argv[]) 
 {
-    /** GENERAL CHARACTERISTICS*/
-    
-    /// Specify the length of the planning horizon
+    /// Lengte van de planningshorizon
     number_days = 28;
-    /// This number i indicates that the first Sunday in the scheduling horizon is on the i'th day.
+    /// De eerste zondag in de planningshorizon is dag 7
     weekend = 7;
-    /// Specify the department to construct a roster for (department = A, B, C or D)
+    /// Afdeling waarvoor een rooster gemaakt wordt (A, B, C of D)
     strcpy(department, "A");
     
+    /// Initialisatie
+    seed = (int)1000;
+    srand((unsigned) seed);
     
-    
-    /** INITIALISATION */
-    seed = (int)1000;               ///< Initialisation of the seed
-    srand((unsigned) seed);			///< Initialisation of the random number generator
-    
-				
-    read_input();			///< Read the required input data
+    read_input();          // inputbestanden inlezen
     
     start_time = clock();
-    procedure();			///< Construct the monthly roster
-    elapsed_time = (float) (clock() - start_time)/CLOCKS_PER_SEC; ///<Keep track of the CPU time
+    procedure();           // rooster maken met CPLEX
+    elapsed_time = (float) (clock() - start_time)/CLOCKS_PER_SEC;
     
-    /** SPECIFICATION OF OUTPUT FILE OF MONTHLY ROSTER*/
-    print_output();
-    
-    /** GENERATE ADDITIONAL OUTPUT DATA */
-    evaluate_solution();
+    print_output();        // rooster wegschrijven
+    evaluate_solution();   // rooster evalueren
     
     return 0;
 }
-
