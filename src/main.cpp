@@ -331,7 +331,7 @@ void read_input()
     read_monthly_roster_rules();				///< Read the constraint set for constructing a monthly roster
     number_shifts = 5;							///< Set the number of shifts to 5 in order to meet the input data
     
-    fclose(input);
+    // fclose(input);  // FIX: bestand werd al gesloten in read_monthly_roster_rules() -> double free
 }
 /**
  This function prints the dummy monthly roster output based on the input files provided by the students.
