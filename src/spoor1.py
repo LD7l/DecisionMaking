@@ -9,11 +9,14 @@ IDEE
   Dit script vult die lijnen in:
     1. de eigen verpleegkundigen krijgen elk één lijn (zo goed mogelijk passend bij
        hun cyclische voorkeur);
-    2. het tekort in FTE (52 - wat het eigen personeel samen werkt) wordt aangeworven.
+    2. is er van een type meer eigen personeel dan lijnen (in FTE), dan wordt dat overschot
+       ontslagen, zolang het type niet onder zijn lijnen zakt (eerst wie geen eigen lijn kreeg);
+    3. het tekort in FTE (52 - wat het eigen personeel samen werkt) wordt aangeworven.
+  Per type is er dus ofwel een tekort (aanwerven), ofwel een overschot (ontslaan), nooit allebei.
   Omdat deeltijdsen minder werken dan hun lijn, zijn er meer mensen dan lijnen.
 
 INPUT  (uit de Excel van de groep)
-  - 'Case D fix (2)'                 : de lijnen (3 x 9h, 5-2 non-identical), de werkpatronen,
+  - 'Case D NoBr' (SHEET_CASE_D)     : de lijnen (3 x 9h, 5-2 non-identical), de werkpatronen,
                                        de starturen van de shiften en de minimale bezetting
   - 'Department X - Nurse Char.'     : per verpleegkundige: type, tewerkstelling, cyclische voorkeur
   - 'Department X - Preferences'     : per verpleegkundige: aversie per dag en shift (28 dagen)
@@ -45,6 +48,7 @@ GEBRUIK
   Open src/spoor1.py in VS Code en druk op Run (of in de terminal: python src/spoor1.py).
   Dan worden alle afdelingen (DEPARTMENTS) doorgerekend.
   Eén afdeling of een andere Excel: python src/spoor1.py --dept A --excel pad/naar/bestand.xlsx
+  Een ander Case D-tabblad:         python src/spoor1.py --sheet "Case D fix (2)"
 """
 
 import argparse
@@ -64,7 +68,7 @@ DATA_DIR = "data"                                # map met de Excel
 FILES_DIR = "files"                              # map waar roster.exe zijn input leest
 RESULTS_DIR = "results"                          # map voor de overzicht-Excels
 
-SHEET_CASE_D = "Case D fix (2)"
+SHEET_CASE_D = "Case D NoBr"    # tabblad met de lijnen van Case D (vroeger: "Case D fix (2)")
 SCENARIO = "3 x 9h"
 POLICY = "5-2 non-identical"
 WEEKS = 4                    # de standaardweek wordt 4 keer herhaald (28 dagen)
@@ -78,6 +82,8 @@ PEN_TYPE1_ON_TYPE2 = 3       # alleen gebruikt als TYPE1_ON_TYPE2 = True: strafp
 
 HIRE_CONTRACTS = [0.5, 0.75, 1.0]   # contracten voor aanwervingen (zoveel mogelijk voltijds)
 HIRE_PREF = 5                       # voorkeurscore van een aanwerving (zoals de template voorstelt)
+
+FIRE_SURPLUS = True          # overschot ontslaan (True) of extra op een lijn laten staan (False)
 
 REQ_WITH_BUFFER = False      # Shift_system-bestand: minimum Case C (False) of eis met buffer (True)
 
@@ -227,12 +233,16 @@ def score(nurse, comp, patterns):
 # STAP 2 - DE EIGEN VERPLEEGKUNDIGEN KRIJGEN ELK ÉÉN LIJN
 # ============================================================================
 
-def assign_own(nurses, comps, patterns):
+def assign_own(nurses, comps, patterns, S=None):
     """Herhaal tot iedereen een lijn heeft: kies het koppel (verpleegkundige, vrije lijn)
     met de laagste strafscore. Bij gelijke score gaat wie het minst perfect passende
-    lijnen heeft eerst, zodat flexibele mensen de rest opvullen. Type I-lijnen eerst."""
-    S = {(n["id"], i): score(n, c, patterns) for n in nurses for i, c in enumerate(comps)}
-    free = {n["id"]: n for n in nurses}
+    lijnen heeft eerst, zodat flexibele mensen de rest opvullen. Type I-lijnen eerst.
+    Opnieuw oproepen met S vult lijnen in die vrijgekomen zijn (na een ontslag)."""
+    if S is None:
+        S = {(n["id"], i): score(n, c, patterns) for n in nurses for i, c in enumerate(comps)}
+        for n in nurses:
+            n["comp"], n["score"], n["status"] = None, 0, "zonder lijn"
+    free = {n["id"]: n for n in nurses if n["comp"] is None and n["status"] != "ontslagen"}
 
     def place(nid, i, status):
         n = free.pop(nid)
@@ -248,12 +258,71 @@ def assign_own(nurses, comps, patterns):
                 break
             _, _, nid, i = min(options)
             place(nid, i, "eigen personeel")
+    return S          # wie nu nog geen lijn heeft: zie fire (stap 2b) en place_extra (stap 2c)
 
-    # wie op geen enkele vrije lijn past (bv. 'No weekend shifts' en alle ma-vr-lijnen bezet),
-    # komt als extra persoon op haar best passende lijn
-    for nid in sorted(free):
-        opts = [(S[nid, i], i) for i in range(len(comps)) if S[nid, i] is not None]
-        place(nid, min(opts)[1], "eigen personeel (extra op lijn)")
+
+def day_gaps(comps, patterns):
+    """Per (shift, dag): hoeveel FTE de lijnen daar samen nog tekortkomen (lijnen - ingevulde FTE)."""
+    gap = {}
+    for c in comps:
+        for d in range(7):
+            if patterns[c["pattern"]]["days"][d]:
+                gap[c["shift"], d] = gap.get((c["shift"], d), 0) + c["lines"] - fte(c)
+    return gap
+
+
+def gain(n, c, gap, patterns):
+    """Hoeveel FTE-gaten persoon n vult als ze op component c komt (opgeteld over haar werkdagen)."""
+    return sum(min(n["rate"], max(0.0, gap[c["shift"], d])) for d in range(7) if patterns[c["pattern"]]["days"][d])
+
+
+def place_extra(nurses, comps, patterns, S):
+    """Wie geen vrije lijn kreeg en niet ontslagen is, komt extra op de lijn waar ze de meeste
+    FTE-gaten per dag vult (bij gelijk: de laagste strafscore, dan de eerste lijn)."""
+    for n in sorted((n for n in nurses if n["comp"] is None and n["status"] != "ontslagen"), key=lambda n: n["id"]):
+        gap = day_gaps(comps, patterns)
+        opts = [i for i in range(len(comps)) if S[n["id"], i] is not None]
+        if not opts:
+            raise ValueError(f"{n['id']} past op geen enkele lijn")
+        i = max(opts, key=lambda i: (gain(n, comps[i], gap, patterns), -S[n["id"], i], -i))
+        comps[i]["members"].append(n)
+        n["comp"], n["score"], n["status"] = i, S[n["id"], i], "eigen personeel (extra op lijn)"
+
+
+# ============================================================================
+# STAP 2b - OVERSCHOT ONTSLAAN  (stap 2c, place_extra, staat bij stap 2)
+# ============================================================================
+
+def fire(nurses, comps):
+    """Overschot ontslaan, zolang dat het tekort dat aangeworven moet worden niet groter maakt
+    (per type, net zoals in hire). Zo wordt alleen echt overtollig personeel ontslagen.
+    Volgorde: eerst wie geen vrije lijn kreeg, daarna wie wel een lijn heeft (die lijn komt dan vrij
+    en wordt opnieuw ingevuld); telkens de hoogste tewerkstelling eerst (zo weinig mogelijk mensen),
+    daarna op nummer. Een overschot dat met niemand exact past, blijft staan."""
+    if not FIRE_SURPLUS:
+        return []
+    need_1 = sum(c["lines"] for c in comps if c["type"] == 1)
+    need_2 = sum(c["lines"] for c in comps if c["type"] == 2)
+
+    def shortage(h1, h2):                        # dezelfde rekenregel als in hire()
+        s1 = max(0.0, need_1 - h1)
+        s2 = max(0.0, need_1 + need_2 - h1 - h2 - s1) if TYPE1_ON_TYPE2 else max(0.0, need_2 - h2)
+        return s1, s2
+
+    have_1 = sum(n["rate"] for n in nurses if n["type"] == 1)
+    have_2 = sum(n["rate"] for n in nurses if n["type"] == 2)
+    fired = []
+    for n in sorted(nurses, key=lambda n: (n["comp"] is not None, -n["rate"], n["id"])):
+        h1 = have_1 - n["rate"] if n["type"] == 1 else have_1
+        h2 = have_2 - n["rate"] if n["type"] == 2 else have_2
+        before, after = shortage(have_1, have_2), shortage(h1, h2)
+        if abs(after[0] - before[0]) <= EPS and abs(after[1] - before[1]) <= EPS:
+            have_1, have_2 = h1, h2
+            if n["comp"] is not None:
+                comps[n["comp"]]["members"].remove(n)
+            n["comp"], n["score"], n["status"] = None, 0, "ontslagen"
+            fired.append(n)
+    return fired
 
 
 # ============================================================================
@@ -274,11 +343,11 @@ def fte(c):
     return sum(m["rate"] for m in c["members"])
 
 
-def hire(nurses, comps, dept):
+def hire(nurses, comps, dept, patterns):
     """Tekort = lijnen - som van de tewerkstelling van het eigen personeel.
     Eerst type I (als er te weinig type I-FTE is), dan type II. Mag type 1 niet op type II-lijnen
     (TYPE1_ON_TYPE2 = False), dan wordt elk type apart geteld: een overschot aan type 1 vult geen type II-lijnen.
-    Elke aanwerving gaat naar de component met het grootste FTE-tekort."""
+    Elke aanwerving gaat naar de lijn waar ze de meeste FTE-gaten per dag vult."""
     need = sum(c["lines"] for c in comps)
     need_1 = sum(c["lines"] for c in comps if c["type"] == 1)
     have = sum(n["rate"] for n in nurses)
@@ -296,8 +365,10 @@ def hire(nurses, comps, dept):
                  "pref": parse_preference(""), "new": True, "score": 0, "status": "aanwerving"}
             allowed = [i for i, c in enumerate(comps)
                        if c["type"] == typ or (typ == 1 and c["type"] == 2 and TYPE1_ON_TYPE2)]
-            # grootste FTE-tekort eerst; bij gelijk tekort: eigen type, dan een lijn die nog leeg is
-            i = max(allowed, key=lambda i: (comps[i]["lines"] - fte(comps[i]), comps[i]["type"] == typ,
+            # meeste gaten per dag eerst; bij gelijk: eigen type, grootste FTE-tekort, een lijn die nog leeg is
+            gap = day_gaps(comps, patterns)
+            i = max(allowed, key=lambda i: (gain(n, comps[i], gap, patterns), comps[i]["type"] == typ,
+                                            comps[i]["lines"] - fte(comps[i]),
                                             comps[i]["lines"] - len(comps[i]["members"]), -i))
             comps[i]["members"].append(n)
             n["comp"] = i
@@ -352,7 +423,7 @@ def add_sheet(wb, title, header, rows, first=False):
     ws.freeze_panes = "A2"
 
 
-def write_overview(path, dept, summary, roster, comps, patterns, shifts, req):
+def write_overview(path, dept, summary, roster, fired, comps, patterns, shifts, req):
     wb = openpyxl.Workbook()
     add_sheet(wb, "Samenvatting", ["", "Waarde"], summary, first=True)
 
@@ -362,6 +433,8 @@ def write_overview(path, dept, summary, roster, comps, patterns, shifts, req):
         days = patterns[c["pattern"]]["days"]
         rows.append([n["id"], n["type"], n["rate"], n["text"], c["shift"], patterns[c["pattern"]]["label"],
                      n["score"], n["status"]] + [LETTER[c["shift"]] if days[d] else "-" for d in range(7)])
+    for n in fired:                                  # ontslagen: niet in het rooster
+        rows.append([n["id"], n["type"], n["rate"], n["text"], "-", "-", "-", n["status"]] + ["-"] * 7)
     add_sheet(wb, "Cyclisch rooster", ["Verpleegkundige", "Type", "Tewerkstelling", "Cyclische voorkeur", "Shift",
                                        "Patroon", "Strafscore", "Status"] + DAYS_NL, rows)
 
@@ -388,7 +461,7 @@ def write_overview(path, dept, summary, roster, comps, patterns, shifts, req):
 # HOOFDPROGRAMMA
 # ============================================================================
 
-def write_readable_roster(path, dept, roster, comps, patterns, shifts):
+def write_readable_roster(path, dept, roster, fired, comps, patterns, shifts):
     """Cyclisch rooster met koppen, om zelf te lezen. Zelfde codes als Cyclic_roster_dpt_X.txt."""
     code = {s["name"]: k + 1 for k, s in enumerate(shifts)}
     days = [f"{DAYS_NL[d % 7]}{d + 1}" for d in range(7 * WEEKS)]
@@ -422,6 +495,8 @@ def write_readable_roster(path, dept, roster, comps, patterns, shifts):
             f.write(line(f"{'':>5}  {'# ' + s_['name']:<9} {'min':>4} {s_['min']:>5}", count))
         f.write("\n'Regel' = regelnummer van die persoon in files/Cyclic_roster_dpt_" + dept + ".txt.\n")
         f.write("Onderaan: hoeveel mensen er die dag op die shift staan, tegenover het minimum uit Case C.\n")
+        if fired:
+            f.write("Ontslagen (staan niet in het rooster): " + ", ".join(n["id"] for n in fired) + "\n")
 
 
 def run_department(wb, dept, out_dir, overview_dir):
@@ -432,16 +507,20 @@ def run_department(wb, dept, out_dir, overview_dir):
     nurses = read_nurses(wb, dept)
     monthly = read_monthly_preferences(wb, dept)
 
-    assign_own(nurses, comps, patterns)          # stap 2
-    hires = hire(nurses, comps, dept)            # stap 3
-    roster = nurses + hires
+    S = assign_own(nurses, comps, patterns)      # stap 2: iedereen die past, krijgt een vrije lijn
+    fired = fire(nurses, comps)                  # stap 2b: overschot ontslaan
+    assign_own(nurses, comps, patterns, S)       #          vrijgekomen lijnen opnieuw invullen
+    place_extra(nurses, comps, patterns, S)      # stap 2c: wie overblijft, komt extra waar de gaten zitten
+    staff = [n for n in nurses if n["status"] != "ontslagen"]
+    hires = hire(staff, comps, dept, patterns)   # stap 3
+    roster = staff + hires
 
     # controles
     need = sum(c["lines"] for c in comps)
     total = sum(n["rate"] for n in roster)
     assert total >= need - EPS, "te weinig FTE"
     assert sum(n["rate"] for n in roster if n["type"] == 1) >= sum(c["lines"] for c in comps if c["type"] == 1) - EPS
-    assert all(score(n, comps[n["comp"]], patterns) is not None for n in nurses), "contractregel geschonden"
+    assert all(score(n, comps[n["comp"]], patterns) is not None for n in staff), "contractregel geschonden"
     assert TYPE1_ON_TYPE2 or all(n["type"] == comps[n["comp"]]["type"] for n in roster), "iemand staat op een lijn van een ander type"
 
     have = sum(n["rate"] for n in nurses)
@@ -457,22 +536,24 @@ def run_department(wb, dept, out_dir, overview_dir):
         ["Tekort (FTE; negatief = overschot)", need - have],
         ["   tekort type I (FTE)", need_1 - have_1],
         ["   tekort type II (FTE)", (need - need_1) - have_2],
+        ["Ontslagen (personen)", len(fired)],
+        ["Ontslagen (FTE)", sum(n["rate"] for n in fired)],
         ["Aanwervingen (personen)", len(hires)],
         ["Aanwervingen (FTE)", sum(h["rate"] for h in hires)],
         ["   contracten", ", ".join(f"{sum(1 for h in hires if h['rate'] == r)} x {r}"
                                     for r in sorted({h["rate"] for h in hires}, reverse=True)) or "-"],
         ["Personen in het cyclisch rooster", len(roster)],
         ["FTE in het cyclisch rooster", total],
-        ["Eigen personeel met strafscore 0", f"{sum(1 for n in nurses if n['score'] == 0)} van {len(nurses)}"],
-        ["Totale strafscore eigen personeel", sum(n["score"] for n in nurses)],
-        ["Eigen personeel extra op een lijn (paste nergens anders)",
-         sum(1 for n in nurses if "extra" in n["status"])],
+        ["Eigen personeel met strafscore 0", f"{sum(1 for n in staff if n['score'] == 0)} van {len(staff)}"],
+        ["Totale strafscore eigen personeel", sum(n["score"] for n in staff)],
+        ["Eigen personeel extra op een lijn (geen vrije lijn meer)",
+         sum(1 for n in staff if "extra" in n["status"])],
     ]
     write_template_files(out_dir, dept, roster, comps, patterns, shifts, monthly)
     overview = os.path.join(overview_dir, f"spoor1_overzicht_dpt_{dept}.xlsx")
-    write_overview(overview, dept, summary, roster, comps, patterns, shifts, req)
+    write_overview(overview, dept, summary, roster, fired, comps, patterns, shifts, req)
     write_readable_roster(os.path.join(overview_dir, f"Cyclic_roster_dpt_{dept}_leesbaar.txt"),
-                          dept, roster, comps, patterns, shifts)
+                          dept, roster, fired, comps, patterns, shifts)
     return summary
 
 
@@ -494,7 +575,9 @@ def main():
     ap.add_argument("--dept", default=DEPARTMENTS, help="bv. A of ABCD")
     ap.add_argument("--out", default=os.path.join(root, FILES_DIR))
     ap.add_argument("--results", default=os.path.join(root, RESULTS_DIR))
+    ap.add_argument("--sheet", default=SHEET_CASE_D, help="tabblad met de lijnen van Case D")
     args = ap.parse_args()
+    globals()["SHEET_CASE_D"] = args.sheet
 
     if not os.path.exists(args.excel):
         raise SystemExit(f"Excel niet gevonden: {args.excel}\n"
@@ -508,7 +591,7 @@ def main():
 
     depts = list(results)
     w = 2 + max(len(str(v)) for d in depts for _, v in results[d])   # kolombreedte
-    print(f"\nSpoor 1 ({SCENARIO}, {POLICY})\n" + "-" * (58 + w * len(depts)))
+    print(f"\nSpoor 1 ({SHEET_CASE_D}: {SCENARIO}, {POLICY})\n" + "-" * (58 + w * len(depts)))
     print(f"{'':<58}" + "".join(f"{d:>{w}}" for d in depts))
     for k in range(1, len(results[depts[0]])):
         label = results[depts[0]][k][0]
