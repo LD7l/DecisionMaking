@@ -73,7 +73,8 @@ WEEKS = 4                    # de standaardweek wordt 4 keer herhaald (28 dagen)
 PEN_SHIFT_PREF = 5           # "Preference for X shifts" en de lijn heeft een ander shifttype
 PEN_DAY_OFF = 1              # per dag van de lijn die ze liever vrij heeft
 PEN_DAY_ON = 1               # per gewenste werkdag die niet in de lijn zit
-PEN_TYPE1_ON_TYPE2 = 3       # type 1 op een type II-lijn: mag, maar liever niet
+TYPE1_ON_TYPE2 = False       # mag een type 1 op een type II-lijn? False = nee: elk type alleen op zijn eigen lijnen
+PEN_TYPE1_ON_TYPE2 = 3       # alleen gebruikt als TYPE1_ON_TYPE2 = True: strafpunten voor type 1 op een type II-lijn
 
 HIRE_CONTRACTS = [0.5, 0.75, 1.0]   # contracten voor aanwervingen (zoveel mogelijk voltijds)
 HIRE_PREF = 5                       # voorkeurscore van een aanwerving (zoals de template voorstelt)
@@ -207,6 +208,8 @@ def score(nurse, comp, patterns):
     """None = mag niet (type of contract). Anders: aantal strafpunten (0 = past perfect)."""
     if nurse["type"] == 2 and comp["type"] == 1:
         return None
+    if nurse["type"] == 1 and comp["type"] == 2 and not TYPE1_ON_TYPE2:
+        return None
     p, days = nurse["pref"], patterns[comp["pattern"]]["days"]
     if comp["shift"] in p["no_shift"] or (p["only_shift"] and comp["shift"] != p["only_shift"]):
         return None
@@ -273,21 +276,26 @@ def fte(c):
 
 def hire(nurses, comps, dept):
     """Tekort = lijnen - som van de tewerkstelling van het eigen personeel.
-    Eerst type I (als er te weinig type I-FTE is), dan type II.
+    Eerst type I (als er te weinig type I-FTE is), dan type II. Mag type 1 niet op type II-lijnen
+    (TYPE1_ON_TYPE2 = False), dan wordt elk type apart geteld: een overschot aan type 1 vult geen type II-lijnen.
     Elke aanwerving gaat naar de component met het grootste FTE-tekort."""
     need = sum(c["lines"] for c in comps)
     need_1 = sum(c["lines"] for c in comps if c["type"] == 1)
     have = sum(n["rate"] for n in nurses)
     have_1 = sum(n["rate"] for n in nurses if n["type"] == 1)
     hire_1 = max(0.0, need_1 - have_1)
-    hire_2 = max(0.0, need - have - hire_1)
+    if TYPE1_ON_TYPE2:
+        hire_2 = max(0.0, need - have - hire_1)
+    else:
+        hire_2 = max(0.0, (need - need_1) - (have - have_1))
 
     hires = []
     for typ, amount in ((1, hire_1), (2, hire_2)):
         for rate in contracts(amount):
             n = {"id": f"NEW{dept}{len(hires) + 1:03d}", "rate": rate, "type": typ, "text": "nieuwe aanwerving",
                  "pref": parse_preference(""), "new": True, "score": 0, "status": "aanwerving"}
-            allowed = [i for i, c in enumerate(comps) if typ == 1 or c["type"] == 2]
+            allowed = [i for i, c in enumerate(comps)
+                       if c["type"] == typ or (typ == 1 and c["type"] == 2 and TYPE1_ON_TYPE2)]
             # grootste FTE-tekort eerst; bij gelijk tekort: eigen type, dan een lijn die nog leeg is
             i = max(allowed, key=lambda i: (comps[i]["lines"] - fte(comps[i]), comps[i]["type"] == typ,
                                             comps[i]["lines"] - len(comps[i]["members"]), -i))
@@ -434,8 +442,12 @@ def run_department(wb, dept, out_dir, overview_dir):
     assert total >= need - EPS, "te weinig FTE"
     assert sum(n["rate"] for n in roster if n["type"] == 1) >= sum(c["lines"] for c in comps if c["type"] == 1) - EPS
     assert all(score(n, comps[n["comp"]], patterns) is not None for n in nurses), "contractregel geschonden"
+    assert TYPE1_ON_TYPE2 or all(n["type"] == comps[n["comp"]]["type"] for n in roster), "iemand staat op een lijn van een ander type"
 
     have = sum(n["rate"] for n in nurses)
+    have_1 = sum(n["rate"] for n in nurses if n["type"] == 1)
+    have_2 = sum(n["rate"] for n in nurses if n["type"] == 2)
+    need_1 = sum(c["lines"] for c in comps if c["type"] == 1)
     summary = [
         ["Afdeling", dept],
         ["Lijnen uit Case D (= FTE nodig)", need],
@@ -443,6 +455,8 @@ def run_department(wb, dept, out_dir, overview_dir):
         ["Eigen personeel (personen)", len(nurses)],
         ["Eigen personeel (FTE)", have],
         ["Tekort (FTE; negatief = overschot)", need - have],
+        ["   tekort type I (FTE)", need_1 - have_1],
+        ["   tekort type II (FTE)", (need - need_1) - have_2],
         ["Aanwervingen (personen)", len(hires)],
         ["Aanwervingen (FTE)", sum(h["rate"] for h in hires)],
         ["   contracten", ", ".join(f"{sum(1 for h in hires if h['rate'] == r)} x {r}"
