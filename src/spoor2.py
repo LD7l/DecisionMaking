@@ -542,7 +542,7 @@ class Roster:
             ch = self.random_move(random.choice(kinds))
             if not ch or not self.changes_something(ch):
                 continue
-            if self.try_move(ch, accept=lambda delta: True):
+            if self.try_move(ch, accept=lambda _: True):
                 done += 1
                 touched.update(c[0] for c in ch)
         return touched
@@ -764,7 +764,7 @@ def demo_instance(n_per_dept=(32, 28, 30, 26), seed=1):
                     target=target, wage=wage, prev_last=prev_last, prev_run=prev_run)
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     inst = demo_instance()
     print("Cyclisch rooster:", Roster(inst, prepare_start(inst, inst.cyclic)).kpis())
     r = vns(inst, inst.cyclic, time_limit=30, verbose=True)
